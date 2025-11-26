@@ -17,6 +17,11 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Network configuration toggles and endpoints
+        buildConfigField("String", "POST_URL_HTTPS", "\"https://labndevor.leoaidc.com/create\"")
+        buildConfigField("String", "POST_URL_HTTP", "\"http://labndevor.leoaidc.com/create\"")
+        buildConfigField("boolean", "NET_HTTP_FALLBACK_ENABLED", "false")
+        buildConfigField("long", "NET_FAILURE_BACKOFF_MS", "60000L")
     }
 
     buildTypes {
@@ -35,6 +40,10 @@ android {
     }
     kotlinOptions {
         jvmTarget = "11"
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 }
 

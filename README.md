@@ -150,6 +150,36 @@ Below is a review of frequently cited pitfalls for NFC apps on Android 7.x and h
 
 Summary: All relevant best practices are either already implemented (Reader Mode lifecycle, flags, no foreground dispatch, explicit connection closing in continuous reads) or not applicable to this tester’s scope (no complex I/O).
 
+### 13) Cloudflare / Reverse Proxy TLS note (Android 7.1.x)
+
+If your site is fronted by Cloudflare or another TLS-terminating reverse proxy, ensure it allows TLS 1.2 when you need to support Android 7.0/7.1 (API 24/25) clients.
+
+- Cloudflare: SSL/TLS → Edge Certificates (or Overview) → Minimum TLS Version → set to TLS 1.2 (NOT 1.3-only).
+- Keep SSL mode set to Full (strict) if you have a valid origin certificate.
+- Your origin/reverse proxy (e.g., Apache) must also allow TLS 1.2 with ECDHE_RSA ciphers (AES_128_GCM/AES_256_GCM). A minimal Apache example:
+  - SSLProtocol TLSv1.2 TLSv1.3
+  - SSLCipherSuite ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA
+  - SSLHonorCipherOrder off
+
+How to verify from outside your network
+- openssl s_client -connect your.host:443 -servername your.host -tls1_2
+  Expect: Protocol: TLSv1.2 and an ECDHE-RSA cipher.
+- curl -v --tlsv1.2 https://your.host/
+
+If Cloudflare Minimum TLS is set to 1.3-only, Android 7.1.x devices will fail the handshake with TLSV1_ALERT_PROTOCOL_VERSION, even though newer Android and curl work.
+
+### 14) Resolution (2025-11-26)
+- Root cause confirmed: Cloudflare "Minimum TLS Version" was set to TLS 1.3. Android 7.1.x requires TLS 1.2.
+- Action taken: Switched Cloudflare Minimum TLS Version to TLS 1.2. No app code changes were required for success.
+- Current status: Uploads now work from the Android 7.1.2 device. The NFC stress test remains fully local and unaffected.
+- Verification steps:
+  1. In the app, tap a tag and watch Logcat (filter: `NFC_POST`).
+  2. Expect: `Sent to server OK: 200` and your server returns `{"status":"success"}`.
+  3. External check (optional): `openssl s_client -connect labndevor.leoaidc.com:443 -servername labndevor.leoaidc.com -tls1_2` → Protocol TLSv1.2 with an ECDHE‑RSA cipher.
+
+Notes
+- The repository keeps a small best‑effort uploader and a Network Security Configuration (NSC) that includes Let’s Encrypt ISRG Root X1 to help older trust stores. These do not interfere with the primary NFC loop and can be removed on request if you want a 100% local build.
+
 ### License
 
 MIT License

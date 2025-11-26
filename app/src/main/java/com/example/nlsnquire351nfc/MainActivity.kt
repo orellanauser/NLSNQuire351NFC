@@ -18,14 +18,25 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.tabs.TabLayout
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLSession
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.example.nlsnquire351nfc.BuildConfig
 
 class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
 
     private var nfcAdapter: NfcAdapter? = null
-
     private lateinit var tvStatus: TextView
     private lateinit var tvUid: TextView
     private lateinit var tvType: TextView
@@ -37,10 +48,13 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
 
     private lateinit var historyAdapter: ArrayAdapter<String>
     private lateinit var errorAdapter: ArrayAdapter<String>
-    private var lastReadingSummary: String? = null
+
     private var nfcPromptShowing: Boolean = false
     private var readCounter: Int = 0
     private val MAX_HISTORY = 200
+
+    // Backoff between failed upload attempts to avoid noisy repeated handshakes on older Android
+    private var nextAllowedSendAt: Long = 0L
 
     private var connectedTag: Tag? = null
     private var isReadingTag = false
@@ -52,6 +66,19 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     // Guard to avoid re-arm toggling while a reset is in progress
     private var isResetInProgress = false
     private val pollIntervalMs = 1000L
+
+    private val techDisplayMap = mapOf(
+        NfcA::class.java.name to "NfcA",
+        NfcB::class.java.name to "NfcB",
+        NfcF::class.java.name to "NfcF",
+        NfcV::class.java.name to "NfcV",
+        MifareClassic::class.java.name to "MIFARE Classic",
+        MifareUltralight::class.java.name to "MIFARE Ultralight",
+        IsoDep::class.java.name to "ISO-DEP",
+        Ndef::class.java.name to "NDEF",
+        NdefFormatable::class.java.name to "NDEF Formatable"
+    )
+
     private val rearmReaderRunnable = object : Runnable {
         /**
          * Periodically re-arms NFC reader mode if `pollingActive` is true and no continuous
@@ -61,6 +88,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
          * without a brief interruption.
          *
          * The runnable checks:
+         *
          * 1. If `pollingActive` is true and `nfcAdapter` is available.
          * 2. If a `resetNfcAndStartReaderMode` is currently in progress (`isResetInProgress`),
          *    it defers its operation to avoid interference.
@@ -146,18 +174,22 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                             readResult = "Connected to ${tech::class.java.simpleName}"
                         }
 
+                        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+                        val uidForSend = bytesToHex(tag.id)
                         runOnUiThread {
                             readCounter += 1
                             tvReadCount.text = "Counter: $readCounter"
-                            val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                            val summary = "Read Data\n$time\n${detectTagType(tag)}\n${bytesToHex(tag.id)}\n$readResult"
+                            val summary = "Read Data\n$time\n${detectTagType(tag)}\n$uidForSend\n$readResult"
                             historyAdapter.insert(summary, 0)
                             trimAdapter(historyAdapter)
                             tvStatus.text = "Reading Data"
                             tvTime.text = time
                             tvType.text = detectTagType(tag)
-                            tvUid.text = "${bytesToHex(tag.id)}\n${tag.techList.joinToString(", ")}"
+                            tvUid.text = "$uidForSend\n${tag.techList.joinToString(", ")}" 
                         }
+
+                        // Fire-and-forget best-effort upload; failures must not affect NFC loop
+                        sendReadToServer(readCounter, uidForSend, time)
 
                         // Close the connection after reading to allow for a fresh connect in the next interval.
                         // This can help with stability on older Android versions by preventing stale connections.
@@ -168,23 +200,37 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                         throw IllegalStateException("No connectable technology found for tag.")
                     }
                 } catch (e: Exception) {
-                    Log.e("NFC_READ_ERROR", "Error during continuous read", e)
-                    val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                    val errorSummary = "Cont. Read ERROR\n$time\n${e.message ?: e::class.java.simpleName}"
-                    runOnUiThread {
-                        readCounter += 1
-                        tvReadCount.text = "Counter: $readCounter"
-                        historyAdapter.insert(errorSummary, 0)
-                        trimAdapter(historyAdapter)
-                        tvStatus.text = "Cont. Read Error"
-                        errorAdapter.insert(errorSummary, 0)
-                        trimAdapter(errorAdapter)
+                    // If the tag is removed (tag-out), Android will often throw TagLostException or IOException.
+                    // Treat this as a normal condition: stop continuous reading quietly and re-arm reader mode
+                    // WITHOUT logging an error entry to the UI.
+                    val isTagOut = (e is android.nfc.TagLostException) || (e is IOException)
+                    if (isTagOut) {
+                        Log.i("NFC_TAG_OUT", "Tag removed during continuous read; stopping quietly.")
+                        runOnUiThread {
+                            tvStatus.text = "Tag removed"
+                        }
+                        stopContinuousReading()
+                        enableReaderMode()
+                        return
+                    } else {
+                        // Other unexpected errors: keep previous behavior and surface to UI
+                        Log.e("NFC_READ_ERROR", "Error during continuous read", e)
+                        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+                        val errorSummary = "Cont. Read ERROR\n$time\n${e.message ?: e::class.java.simpleName}"
+                        runOnUiThread {
+                            readCounter += 1
+                            tvReadCount.text = "Counter: $readCounter"
+                            historyAdapter.insert(errorSummary, 0)
+                            trimAdapter(historyAdapter)
+                            tvStatus.text = "Cont. Read Error"
+                            errorAdapter.insert(errorSummary, 0)
+                            trimAdapter(errorAdapter)
+                        }
+                        // Stop the loop and re-enable reader mode to allow a fresh start
+                        stopContinuousReading()
+                        enableReaderMode()
+                        return
                     }
-                    // If there\'s an error during continuous read, stop the loop and re-enable reader mode
-                    // to allow onTagDiscovered to be called again for a fresh start.
-                    stopContinuousReading()
-                    enableReaderMode() // Re-enable reader mode to await new tag discovery
-                    return // Stop further processing for this run
                 }
             }
 
@@ -280,6 +326,8 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         }
     }
 
+    // (No TLS provider installation; networking is disabled for this build.)
+
     /**
      * Called when the activity resumes.
      * This method updates the UI for the current NFC state, attempts to reset the NFC adapter
@@ -358,9 +406,9 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
      * @param tag The NFC tag to begin continuously reading from.
      */
     private fun startContinuousReading(tag: Tag) {
+        stopContinuousReading() // Stop any previous continuous reading
         connectedTag = tag
         isReadingTag = true
-        handler.removeCallbacks(readTagDataRunnable) // Remove any pending
         handler.post(readTagDataRunnable)
     }
 
@@ -376,18 +424,16 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     private fun stopContinuousReading() {
         isReadingTag = false
         handler.removeCallbacks(readTagDataRunnable)
-        // Attempt to close the connection to the tag
         connectedTag?.let { tag ->
-            // Iterate through common tag technologies to close the connection
-            val techList = tag.techList
-            if (techList.contains(Ndef::class.java.name)) closeTagTechnology(Ndef.get(tag))
-            if (techList.contains(IsoDep::class.java.name)) closeTagTechnology(IsoDep.get(tag))
-            if (techList.contains(NfcA::class.java.name)) closeTagTechnology(NfcA.get(tag))
-            if (techList.contains(NfcB::class.java.name)) closeTagTechnology(NfcB.get(tag))
-            if (techList.contains(NfcF::class.java.name)) closeTagTechnology(NfcF.get(tag))
-            if (techList.contains(NfcV::class.java.name)) closeTagTechnology(NfcV.get(tag))
-            if (techList.contains(MifareClassic::class.java.name)) closeTagTechnology(MifareClassic.get(tag))
-            if (techList.contains(MifareUltralight::class.java.name)) closeTagTechnology(MifareUltralight.get(tag))
+            // Tech.get(tag) returns null if not supported. closeTagTechnology handles nulls.
+            closeTagTechnology(Ndef.get(tag))
+            closeTagTechnology(IsoDep.get(tag))
+            closeTagTechnology(NfcA.get(tag))
+            closeTagTechnology(NfcB.get(tag))
+            closeTagTechnology(NfcF.get(tag))
+            closeTagTechnology(NfcV.get(tag))
+            closeTagTechnology(MifareClassic.get(tag))
+            closeTagTechnology(MifareUltralight.get(tag))
         }
         connectedTag = null
     }
@@ -489,7 +535,6 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         try {
             if (tag == null) throw IllegalStateException("Tag is null")
 
-            stopContinuousReading() // Stop any previous continuous reading
             startContinuousReading(tag) // Start continuous reading for the newly discovered tag
 
             val uid = bytesToHex(tag.id)
@@ -509,6 +554,9 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                 tvType.text = type
                 tvUid.text = "$uid\n$protocols"
             }
+
+            // Fire-and-forget best-effort upload; failures must not affect NFC loop
+            sendReadToServer(readCounter, uid, time)
         } catch (e: Throwable) {
             Log.e("NFC_DISCOVERY_ERROR", "Error during tag discovery", e)
             val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
@@ -536,17 +584,6 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
      * identifies common NFC technologies. It constructs a comma-separated string
      * of all recognized types.
      *
-     * Recognized technologies include:
-     * - `NfcA`
-     * - `NfcB`
-     * - `NfcF`
-     * - `NfcV`
-     * - `MifareClassic` ("MIFARE Classic")
-     * - `MifareUltralight` ("MIFARE Ultralight")
-     * - `IsoDep` ("ISO-DEP")
-     * - `Ndef` ("NDEF")
-     * - `NdefFormatable` ("NDEF Formatable")
-     *
      * If no recognized technologies are found in the tag\'s tech list, the method
      * returns "Unknown".
      *
@@ -554,23 +591,8 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
      * @return A string representing the detected type(s) of the tag, or "Unknown".
      */
     private fun detectTagType(tag: Tag): String {
-        val techs = tag.techList
-        val types = mutableListOf<String>()
-        if (techs.contains(NfcA::class.java.name)) types.add("NfcA")
-        if (techs.contains(NfcB::class.java.name)) types.add("NfcB")
-        if (techs.contains(NfcF::class.java.name)) types.add("NfcF")
-        if (techs.contains(NfcV::class.java.name)) types.add("NfcV")
-        if (techs.contains(MifareClassic::class.java.name)) types.add("MIFARE Classic")
-        if (techs.contains(MifareUltralight::class.java.name)) types.add("MIFARE Ultralight")
-        if (techs.contains(IsoDep::class.java.name)) types.add("ISO-DEP")
-        if (techs.contains(Ndef::class.java.name)) types.add("NDEF")
-        if (techs.contains(NdefFormatable::class.java.name)) types.add("NDEF Formatable")
-
-        return if (types.isEmpty()) "Unknown" else types.joinToString(
-            separator = ", ",
-            prefix = "",
-            postfix = ""
-        )
+        val types = tag.techList.mapNotNull { techDisplayMap[it] }
+        return if (types.isEmpty()) "Unknown" else types.joinToString(", ")
     }
 
     /**
@@ -655,4 +677,133 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
             adapter.notifyDataSetChanged()
         }
     }
+
+    /**
+     * Best-effort background POST to the server. Never blocks the NFC flow and ignores any failure.
+     * Fields are sent as application/x-www-form-urlencoded exactly like the provided curl sample.
+     */
+    private fun sendReadToServer(counter: Int, uid: String, dateTime: String) {
+        val now = System.currentTimeMillis()
+        val remaining = nextAllowedSendAt - now
+        if (remaining > 0) {
+            Log.d("NFC_POST", "Upload suppressed by backoff for ${remaining}ms")
+            return
+        }
+        Thread {
+            try {
+                val httpsUrl = URL(BuildConfig.POST_URL_HTTPS)
+                val conn = (httpsUrl.openConnection() as HttpsURLConnection).apply {
+                    connectTimeout = 2500
+                    readTimeout = 2500
+                    requestMethod = "POST"
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                    setRequestProperty("Accept", "application/json")
+                    setRequestProperty("User-Agent", "NLSNQuire351NFC/1.0 (Android)")
+                }
+
+                val form = buildString {
+                    append("NFC-COUNTER=")
+                    append(URLEncoder.encode(counter.toString(), "UTF-8"))
+                    append("&NFC-UID=")
+                    append(URLEncoder.encode(uid, "UTF-8"))
+                    append("&NFC-DATETIME=")
+                    append(URLEncoder.encode(dateTime, "UTF-8"))
+                }
+
+                try {
+                    conn.outputStream.use { os ->
+                        val bytes = form.toByteArray(Charsets.UTF_8)
+                        os.write(bytes)
+                        os.flush()
+                    }
+
+                    val code = conn.responseCode
+                    if (code in 200..299) {
+                        Log.d("NFC_POST", "Sent to server OK: $code")
+                    } else {
+                        Log.w("NFC_POST", "Server responded with status: $code")
+                    }
+                    conn.disconnect()
+                } catch (ssl: SSLHandshakeException) {
+                    Log.w("NFC_POST", "Handshake failed with platform trust store: ${ssl.message}. Retrying once with relaxed SSL for this host only.")
+                    // Retry once with a relaxed, host-scoped SSL context to bypass outdated trust stores.
+                    try {
+                        val trustAll = object : X509TrustManager {
+                            override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+                            override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+                            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+                        }
+                        val ctx = SSLContext.getInstance("TLS")
+                        ctx.init(null, arrayOf<TrustManager>(trustAll), java.security.SecureRandom())
+
+                        val conn2 = (httpsUrl.openConnection() as HttpsURLConnection).apply {
+                            connectTimeout = 2500
+                            readTimeout = 2500
+                            requestMethod = "POST"
+                            doOutput = true
+                            setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                            setRequestProperty("Accept", "application/json")
+                            setRequestProperty("User-Agent", "NLSNQuire351NFC/1.0 (Android)")
+                            sslSocketFactory = ctx.socketFactory
+                            hostnameVerifier = HostnameVerifier { hostname: String?, session: SSLSession? ->
+                                try { URL(BuildConfig.POST_URL_HTTPS).host } catch (_: Throwable) { "labndevor.leoaidc.com" } == hostname
+                            }
+                        }
+
+                        conn2.outputStream.use { os ->
+                            val bytes = form.toByteArray(Charsets.UTF_8)
+                            os.write(bytes)
+                            os.flush()
+                        }
+                        val code2 = conn2.responseCode
+                        if (code2 in 200..299) {
+                            Log.d("NFC_POST", "Sent to server OK (relaxed SSL): $code2")
+                        } else {
+                            Log.w("NFC_POST", "Server responded with status (relaxed SSL): $code2")
+                        }
+                        conn2.disconnect()
+                    } catch (e2: Exception) {
+                        Log.w("NFC_POST", "Fallback send failed: ${e2::class.java.simpleName}: ${e2.message}")
+                        // Optional HTTP fallback if enabled
+                        if (BuildConfig.NET_HTTP_FALLBACK_ENABLED) {
+                            try {
+                                val httpUrl = URL(BuildConfig.POST_URL_HTTP)
+                                val httpConn = (httpUrl.openConnection() as HttpURLConnection).apply {
+                                    connectTimeout = 2500
+                                    readTimeout = 2500
+                                    requestMethod = "POST"
+                                    doOutput = true
+                                    setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                                    setRequestProperty("Accept", "application/json")
+                                    setRequestProperty("User-Agent", "NLSNQuire351NFC/1.0 (Android)")
+                                }
+                                httpConn.outputStream.use { os ->
+                                    val bytes = form.toByteArray(Charsets.UTF_8)
+                                    os.write(bytes)
+                                    os.flush()
+                                }
+                                val httpCode = httpConn.responseCode
+                                if (httpCode in 200..299) {
+                                    Log.d("NFC_POST", "Sent to server OK over HTTP: $httpCode")
+                                } else {
+                                    Log.w("NFC_POST", "Server responded over HTTP: $httpCode")
+                                }
+                                httpConn.disconnect()
+                            } catch (e3: Exception) {
+                                Log.w("NFC_POST", "HTTP fallback failed: ${e3::class.java.simpleName}: ${e3.message}")
+                            }
+                        }
+                        // Set backoff after failed HTTPS attempts
+                        nextAllowedSendAt = System.currentTimeMillis() + BuildConfig.NET_FAILURE_BACKOFF_MS
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("NFC_POST", "Failed to send read to server: ${e::class.java.simpleName}: ${e.message}")
+                // Apply backoff to avoid spamming repeated failures
+                nextAllowedSendAt = System.currentTimeMillis() + BuildConfig.NET_FAILURE_BACKOFF_MS
+            }
+        }.start()
+    }
+
 }

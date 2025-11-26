@@ -1,15 +1,26 @@
 *.iml
 .gradle
 /local.properties
+# Ignore the entire Android Studio project settings directory
+/.idea/
+# Legacy patterns (kept for safety if some users still have specific files tracked)
 /.idea/caches
 /.idea/libraries
 /.idea/modules.xml
 /.idea/workspace.xml
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
+
 .DS_Store
 /build
+*/build/
 /captures
 .externalNativeBuild
 .cxx
 local.properties
+
+# Ignore common build outputs
+*.apk
+*.aab
+*.log
+*.tmp

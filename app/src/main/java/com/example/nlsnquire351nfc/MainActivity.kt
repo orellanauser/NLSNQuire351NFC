@@ -2,6 +2,7 @@ package com.example.nlsnquire351nfc
 
 import android.app.AlertDialog
 import android.content.Intent
+import android.os.Build
 import android.nfc.*
 import android.nfc.tech.*
 import android.os.Bundle
@@ -18,7 +19,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.tabs.TabLayout
+import java.io.BufferedReader
+import java.io.File
+import java.io.FileInputStream
 import java.io.IOException
+import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -78,6 +83,69 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         Ndef::class.java.name to "NDEF",
         NdefFormatable::class.java.name to "NDEF Formatable"
     )
+
+    // Device info (model + serial) to show in UI and send to server
+    private var deviceModel: String = ""
+    private var deviceSerial: String = ""
+    private var statusHeader: String = ""
+
+    private fun readFirstLine(path: String): String? {
+        return try {
+            val f = File(path)
+            if (f.exists() && f.canRead()) {
+                FileInputStream(f).use { fis ->
+                    BufferedReader(InputStreamReader(fis)).use { br ->
+                        br.readLine()?.trim()?.takeIf { it.isNotEmpty() }
+                    }
+                }
+            } else null
+        } catch (_: Throwable) { null }
+    }
+
+    private fun getSystemProperty(key: String): String? {
+        return try {
+            val cls = Class.forName("android.os.SystemProperties")
+            val m = cls.getMethod("get", String::class.java, String::class.java)
+            val value = (m.invoke(null, key, "") as String).trim()
+            if (value.isNotEmpty()) value else null
+        } catch (_: Throwable) { null }
+    }
+
+    private fun resolveDeviceSerial(): String {
+        // 1) Newland sysfs path (Android 11+ known). Try on 7.1 too in case OEM shipped it.
+        val sysfsPaths = listOf(
+            "/sys/bus/platform/devices/newland-misc/SN",
+            "/sys/devices/platform/newland-misc/SN",
+            "/sys/bus/platform/devices/newland_misc/SN",
+            "/sys/devices/platform/newland_misc/SN"
+        )
+        for (p in sysfsPaths) {
+            readFirstLine(p)?.let { return it }
+        }
+        // 2) System properties commonly used for serial
+        val props = listOf("ro.serialno", "ro.boot.serialno", "ro.hardware.serial")
+        for (k in props) {
+            getSystemProperty(k)?.let { return it }
+        }
+        // 3) Build.SERIAL (deprecated but present on API 25)
+        try {
+            val b = Build.SERIAL
+            if (!b.isNullOrBlank() && !b.equals("UNKNOWN", ignoreCase = true)) return b
+        } catch (_: Throwable) {}
+        // 4) Fallback: ANDROID_ID (not a serial, but stable per device+signing key)
+        return try {
+            val id = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+            id ?: "UNKNOWN"
+        } catch (_: Throwable) { "UNKNOWN" }
+    }
+
+    private fun setStatus(message: String) {
+        if (statusHeader.isNotEmpty()) {
+            tvStatus.text = "$statusHeader\n$message"
+        } else {
+            tvStatus.text = message
+        }
+    }
 
     private val rearmReaderRunnable = object : Runnable {
         /**
@@ -182,7 +250,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                             val summary = "Read Data\n$time\n${detectTagType(tag)}\n$uidForSend\n$readResult"
                             historyAdapter.insert(summary, 0)
                             trimAdapter(historyAdapter)
-                            tvStatus.text = "Reading Data"
+                            setStatus("Reading Data")
                             tvTime.text = time
                             tvType.text = detectTagType(tag)
                             tvUid.text = "$uidForSend\n${tag.techList.joinToString(", ")}" 
@@ -206,9 +274,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                     val isTagOut = (e is android.nfc.TagLostException) || (e is IOException)
                     if (isTagOut) {
                         Log.i("NFC_TAG_OUT", "Tag removed during continuous read; stopping quietly.")
-                        runOnUiThread {
-                            tvStatus.text = "Tag removed"
-                        }
+                        runOnUiThread { setStatus("Tag removed") }
                         stopContinuousReading()
                         enableReaderMode()
                         return
@@ -222,7 +288,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                             tvReadCount.text = "Counter: $readCounter"
                             historyAdapter.insert(errorSummary, 0)
                             trimAdapter(historyAdapter)
-                            tvStatus.text = "Cont. Read Error"
+                            setStatus("Cont. Read Error")
                             errorAdapter.insert(errorSummary, 0)
                             trimAdapter(errorAdapter)
                         }
@@ -317,9 +383,17 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         })
         tabLayout.getTabAt(0)?.select()
 
+        // Initialize device info (model + serial) for header and server payload
+        deviceModel = listOfNotNull(Build.MANUFACTURER, Build.MODEL)
+            .joinToString(" ")
+            .trim()
+            .ifEmpty { Build.MODEL ?: "Unknown" }
+        deviceSerial = resolveDeviceSerial()
+        statusHeader = "Device: $deviceModel | SN: $deviceSerial"
+
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         if (nfcAdapter == null) {
-            tvStatus.text = "This device does not support NFC"
+            setStatus("This device does not support NFC")
             Toast.makeText(this, "NFC not supported", Toast.LENGTH_LONG).show()
         } else {
             updateUiForNfcState()
@@ -549,7 +623,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                 // Insert the current event at the top for a strict chronological log
                 historyAdapter.insert(summary, 0)
                 trimAdapter(historyAdapter)
-                tvStatus.text = "Tag Discovered"
+                setStatus("Tag Discovered")
                 tvTime.text = time
                 tvType.text = type
                 tvUid.text = "$uid\n$protocols"
@@ -567,7 +641,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                 // Log error into both history and error lists
                 historyAdapter.insert(errorSummary, 0)
                 trimAdapter(historyAdapter)
-                tvStatus.text = "Discovery Error"
+                setStatus("Discovery Error")
                 tvUid.text = ""
                 tvType.text = ""
                 tvTime.text = time
@@ -626,13 +700,13 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     private fun updateUiForNfcState() {
         val adapter = nfcAdapter
         if (adapter == null) {
-            tvStatus.text = "This device does not support NFC"
+            setStatus("This device does not support NFC")
             tvStatus.setOnClickListener(null)
             return
         }
 
         if (!adapter.isEnabled) {
-            tvStatus.text = "NFC is disabled. Tap here to enable."
+            setStatus("NFC is disabled. Tap here to enable.")
             tvStatus.setOnClickListener {
                 startActivity(Intent(Settings.ACTION_NFC_SETTINGS))
             }
@@ -655,7 +729,7 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                     .show()
             }
         } else {
-            tvStatus.text = "Tap an NFC card to read"
+            setStatus("Tap an NFC card to read")
             tvStatus.setOnClickListener(null)
         }
     }
@@ -703,7 +777,13 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                 }
 
                 val form = buildString {
-                    append("NFC-COUNTER=")
+                    // Include device info as requested
+                    append("DEV_TYPE=")
+                    append(URLEncoder.encode(deviceModel, "UTF-8"))
+                    append("&DEV_SN=")
+                    append(URLEncoder.encode(deviceSerial, "UTF-8"))
+                    // Then the NFC fields exactly as in the sample
+                    append("&NFC-COUNTER=")
                     append(URLEncoder.encode(counter.toString(), "UTF-8"))
                     append("&NFC-UID=")
                     append(URLEncoder.encode(uid, "UTF-8"))

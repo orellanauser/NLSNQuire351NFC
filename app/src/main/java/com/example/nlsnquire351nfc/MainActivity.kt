@@ -89,6 +89,17 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
     private var deviceSerial: String = ""
     private var statusHeader: String = ""
 
+    /**
+     * Attempts to read the first line of a file at the given path.
+     *
+     * If the file exists and can be read, this method opens a FileInputStream for the file,
+     * wraps it in a BufferedReader, and reads the first line. The line is then trimmed
+     * and returned if it is not empty. If the file does not exist, cannot be read, or
+     * an exception occurs during the read operation, this method returns null.
+     *
+     * @param path The path to the file to read.
+     * @return The first line of the file if it exists and can be read, or null otherwise.
+     */
     private fun readFirstLine(path: String): String? {
         return try {
             val f = File(path)
@@ -102,6 +113,17 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         } catch (_: Throwable) { null }
     }
 
+    /**
+     * Attempts to retrieve the value of a system property using reflection.
+     * The [android.os.SystemProperties] class contains a method named `get` which
+     * takes two `String` parameters, a key and a default value. We use reflection to invoke
+     * this method and retrieve the value associated with the provided `key`.
+     *
+     * If the reflection operation fails or the value is empty, null is returned.
+     *
+     * @param key The key of the system property to retrieve.
+     * @return The value associated with the provided `key`, or null if the operation fails.
+     */
     private fun getSystemProperty(key: String): String? {
         return try {
             val cls = Class.forName("android.os.SystemProperties")
@@ -111,6 +133,15 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         } catch (_: Throwable) { null }
     }
 
+    /**
+     * Attempts to resolve the device serial number in the order:
+     * 1. Newland sysfs path (Android 11+ known). Try on 7.1 too in case OEM shipped it.
+     * 2. System properties commonly used for serial (`ro.serialno`, `ro.boot.serialno`, `ro.hardware.serial`).
+     * 3. Build.SERIAL (deprecated but present on API 25).
+     * 4. Fallback: ANDROID_ID (not a serial, but stable per device+signing key).
+     *
+     * @return The resolved device serial number, or "UNKNOWN" if all methods fail.
+     */
     private fun resolveDeviceSerial(): String {
         // 1) Newland sysfs path (Android 11+ known). Try on 7.1 too in case OEM shipped it.
         val sysfsPaths = listOf(
@@ -139,6 +170,13 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
         } catch (_: Throwable) { "UNKNOWN" }
     }
 
+    /**
+     * Sets the text of the status TextView (`tvStatus`) to the given `message`.
+     * If `statusHeader` is not empty, the `message` is appended to the header with a newline
+     * separator. Otherwise, the `message` is set directly.
+     *
+     * @param message The message to set on the status TextView.
+     */
     private fun setStatus(message: String) {
         if (statusHeader.isNotEmpty()) {
             tvStatus.text = "$statusHeader\n$message"
@@ -382,6 +420,43 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
             override fun onTabReselected(tab: TabLayout.Tab?) {}
         })
         tabLayout.getTabAt(0)?.select()
+
+        // Execution guard: allow ONLY Newland NQuire 300/304/351 models with Android 7 (API 24–25).
+        // Any other device/model/version should show a warning for 10 seconds and exit.
+        run {
+            val model = Build.MODEL ?: ""
+
+            // Normalize to compare variations like "NQuire351", "NQuire 351", "nq351", etc.
+            val norm = model.lowercase(Locale.getDefault())
+                .replace(" ", "")
+                .replace("-", "")
+                .replace("_", "")
+
+            val isAllowedNquireModel =
+                norm.contains("nquire300") || norm.contains("nq300") ||
+                norm.contains("nquire304") || norm.contains("nq304") ||
+                norm.contains("nquire351") || norm.contains("nq351")
+
+            val isAndroid7 = Build.VERSION.SDK_INT in 24..25
+
+            if (!isAllowedNquireModel && !isAndroid7) {
+                val message = buildString {
+                    append("App target are Newland NQuire351 Android 7 devices only.\n\nThe app will close.")
+                }
+                setStatus(message)
+                val dlg = AlertDialog.Builder(this)
+                    .setTitle("Unsupported device")
+                    .setMessage(message)
+                    .setCancelable(false)
+                    .create()
+                dlg.show()
+                Handler(Looper.getMainLooper()).postDelayed({
+                    try { dlg.dismiss() } catch (_: Throwable) {}
+                    finish()
+                }, 10_000)
+                return
+            }
+        }
 
         // Initialize device info (model + serial) for header and server payload
         deviceModel = listOfNotNull(Build.MANUFACTURER, Build.MODEL)
@@ -810,9 +885,39 @@ class MainActivity : AppCompatActivity(), NfcAdapter.ReaderCallback {
                     // Retry once with a relaxed, host-scoped SSL context to bypass outdated trust stores.
                     try {
                         val trustAll = object : X509TrustManager {
+                            /**
+                             * Always succeeds, without performing any checks on the client certificate chain.
+                             * This implementation is used as a last resort when the platform trust store is outdated, and
+                             * the server's certificate cannot be verified otherwise.
+                             *
+                             * @param chain The client certificate chain to verify.
+                             * @param authType The authentication type based on the client certificate.
+                             */
                             override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+                            /**
+                             * This implementation does not verify the server's certificate chain.
+                             * It always succeeds without performing any checks on the server certificate chain.
+                             * This implementation is used as a last resort when the platform trust store is outdated, and
+                             * the server's certificate cannot be verified otherwise.
+                             *
+                             * @param chain The server certificate chain to verify.
+                             * @param authType The authentication type based on the server certificate.
+                             */
                             override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+                            /**
+                             * Always returns an empty array, as this implementation does not perform any
+                             * certificate chain verification.
+                             *
+                             * @return An empty array of X509 certificates.
+                             */
                             override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+                        /**
+                         * Verifies the server's certificate chain. This implementation does not perform any checks, and
+                         * always succeeds.
+                         *
+                         * @param chain The server certificate chain to verify.
+                         * @param authType The authentication type based on the server certificate.
+                         */
                         }
                         val ctx = SSLContext.getInstance("TLS")
                         ctx.init(null, arrayOf<TrustManager>(trustAll), java.security.SecureRandom())
